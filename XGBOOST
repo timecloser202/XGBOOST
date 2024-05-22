@@ -1,0 +1,112 @@
+# Load required libraries
+required_packages <- c("xgboost", "readr", "lubridate", "dplyr", "caret", "lattice", "ggplot2")
+install_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(install_packages)) install.packages(install_packages, dependencies = TRUE)
+invisible(lapply(required_packages, library, character.only = TRUE, quietly = TRUE))
+
+# Define file paths and corresponding tickers
+files <- c(
+  "/kaggle/input/final-merged-dataset/AAPL_merged_data (1).csv" = "AAPL",
+  "/kaggle/input/final-merged-dataset/AMZN_merged_data (1).csv" = "AMZN",
+  "/kaggle/input/final-merged-dataset/GOOG_merged_data (1).csv" = "GOOG",
+  "/kaggle/input/final-merged-dataset/MSFT_merged_data (1).csv" = "MSFT",
+  "/kaggle/input/final-merged-dataset/TSLA_merged_data (1).csv" = "TSLA"
+)
+
+# Read and merge data
+data_list <- lapply(names(files), function(file) {
+  data <- read_csv(file, col_types = cols())
+  data$Ticker <- files[[file]]
+  return(data)
+})
+full_dataset <- bind_rows(data_list)
+
+# Preprocess data
+full_dataset <- full_dataset %>%
+  mutate(Date = ymd(Date),
+         Excess_Return = c(NA, diff(Excess_Return)),
+         across(c(RSI, Volatility), list(lag1 = lag, lag2 = ~lag(.x, 2), lag3 = ~lag(.x, 3))),
+         Excess_Return_lag1 = lag(Excess_Return, 1),
+         Excess_Return_lag2 = lag(Excess_Return, 2),
+         Excess_Return_lag3 = lag(Excess_Return, 3),
+         Year = year(Date),
+         Quarter = quarter(Date),
+         Month = month(Date),
+         Week = week(Date),
+         DayOfWeek = wday(Date),
+         DayOfYear = yday(Date)
+  ) %>%
+  ungroup() %>%
+  tibble::rownames_to_column(var = "Row")
+
+# Function to create Fourier terms for seasonality
+create_fourier_terms <- function(data, column, K, period) {
+  for (k in 1:K) {
+    data[[paste0("sin_", k)]] <- sin(2 * pi * k * data[[column]] / period)
+    data[[paste0("cos_", k)]] <- cos(2 * pi * k * data[[column]] / period)
+  }
+  return(data)
+}
+
+# Adding Fourier terms for annual seasonality
+full_dataset <- create_fourier_terms(full_dataset, "DayOfYear", K = 3, period = 252)
+
+# Split data for training and testing
+split_date <- as.Date("2019-01-01")
+train_data <- full_dataset[full_dataset$Date < split_date, ][21:nrow(full_dataset[full_dataset$Date < split_date, ]), ]
+test_data <- full_dataset[full_dataset$Date >= split_date, ][21:nrow(full_dataset[full_dataset$Date >= split_date, ]), ]
+
+# Define features
+features <- c("RSI", "Volatility", "Avg_Volume", "Excess_Return_lag1", "Excess_Return_lag2", "Excess_Return_lag3", "sin_1", "cos_1", "sin_2", "cos_2", "sin_3", "cos_3")
+
+# Apply transformations
+train_data$"Rolling Sentiment" <- scale(train_data$"Rolling Sentiment")
+test_data$"Rolling Sentiment" <- scale(test_data$"Rolling Sentiment")
+
+# Create interaction terms
+train_data$Rolling_Sentiment_Avg_Volume <- train_data$"Rolling Sentiment" * train_data$Avg_Volume
+test_data$Rolling_Sentiment_Avg_Volume <- test_data$"Rolling Sentiment" * test_data$Avg_Volume
+
+# Update features
+features <- c(features, "Rolling_Sentiment_Avg_Volume")
+
+# Train the model
+train_control <- trainControl(method = "cv", number = 5)
+set.seed(123)
+final_model <- train(x = train_data[, features], 
+                     y = train_data$Excess_Return, 
+                     method = "xgbTree",
+                     trControl = train_control)
+
+# Make predictions
+predictions_xgboost <- predict(final_model, newdata = test_data[, features])
+
+# Plot actual vs. predicted
+test_data <- test_data %>% mutate(Predicted_Return = predictions_xgboost)
+ggplot(test_data, aes(x = Date)) +
+  geom_line(aes(y = Excess_Return, colour = "Actual")) +
+  geom_line(aes(y = Predicted_Return, colour = "Predicted")) +
+  scale_colour_manual(values = c("Actual" = "blue", "Predicted" = "red")) +
+  labs(title = "Actual vs Predicted Excess Returns Over Time", x = "Date", y = "Excess Return") +
+  theme_minimal()
+
+# Evaluate model performance
+rss <- sum((test_data$Excess_Return - test_data$Predicted_Return)^2)
+tss <- sum((test_data$Excess_Return)^2)
+R2 <- 1 - rss / tss
+
+n <- nrow(test_data)
+p <- length(features)
+R2_adj <- 1 - (1 - R2) * (n - 1) / (n - p - 1)
+
+# Print evaluation metrics
+cat("Out-of-Sample R-squared:", R2, "\n")
+cat("Adjusted R-squared:", R2_adj, "\n")
+cat("Correlation:", cor(test_data$Predicted_Return, test_data$Excess_Return, use = "complete.obs"), "\n")
+cat("RMSE:", sqrt(mean((test_data$Predicted_Return - test_data$Excess_Return)^2, na.rm = TRUE)), "\n")
+cat("MSE:", mean((test_data$Predicted_Return - test_data$Excess_Return)^2, na.rm = TRUE), "\n")
+
+# Print feature importance
+print(xgb.importance(model = final_model$finalModel))
+# Print feature importance
+print(xgb.importance(model = final_model$finalModel))
